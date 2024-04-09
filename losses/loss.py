@@ -62,7 +62,7 @@ class TwoStageLoss(Loss):
             logits, logits_stg1 = self.D(img, mask, img_stg1, c)
         return logits, logits_stg1
 
-    def accumulate_gradients(self, phase, real_img, mask, real_c, gen_z, gen_c, sync, gain):
+    def accumulate_gradients(self, phase, real_img, mask, real_c, domain, gen_z, gen_c, sync, gain):
         assert phase in ['Gmain', 'Greg', 'Gboth', 'Dmain', 'Dreg', 'Dboth']
         do_Gmain = (phase in ['Gmain', 'Gboth'])
         do_Dmain = (phase in ['Dmain', 'Dboth'])

@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
 #
 # NVIDIA CORPORATION and its licensors retain all intellectual property
 # and proprietary rights in and to this software, related documentation
@@ -6,51 +6,38 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+import cv2
 import os
 import numpy as np
 import zipfile
 import PIL.Image
-import cv2
 import json
 import torch
 import dnnlib
-import glob
+import random
 
 try:
     import pyspng
 except ImportError:
     pyspng = None
 
-from mask_generator_512 import RandomMask
+from .mask_generator_512 import RandomMask
 
 #----------------------------------------------------------------------------
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self,
         name,                   # Name of the dataset.
-        raw_shape,              # Shape of the raw image data (NCHW).
-        max_size    = None,     # Artificially limit the size of the dataset. None = no limit. Applied before xflip.
+        size = 512,
         use_labels  = False,    # Enable conditioning labels? False = label dimension is zero.
-        xflip       = False,    # Artificially double the size of the dataset via x-flips. Applied after max_size.
-        random_seed = 0,        # Random seed to use when applying max_size.
     ):
         self._name = name
-        self._raw_shape = list(raw_shape)
+        self._raw_shape = list(size)
         self._use_labels = use_labels
-        self._raw_labels = None
-        self._label_shape = None
+        self._raw_labels = ['head', 'body']
+        self._label_shape = len(self._raw_labels)
+        self._domains = ['target', 'g']
 
-        # Apply max_size.
-        self._raw_idx = np.arange(self._raw_shape[0], dtype=np.int64)
-        if (max_size is not None) and (self._raw_idx.size > max_size):
-            np.random.RandomState(random_seed).shuffle(self._raw_idx)
-            self._raw_idx = np.sort(self._raw_idx[:max_size])
-
-        # Apply xflip.
-        self._xflip = np.zeros(self._raw_idx.size, dtype=np.uint8)
-        if xflip:
-            self._raw_idx = np.tile(self._raw_idx, 2)
-            self._xflip = np.concatenate([self._xflip, np.ones_like(self._xflip)])
 
     def _get_raw_labels(self):
         if self._raw_labels is None:
@@ -64,24 +51,6 @@ class Dataset(torch.utils.data.Dataset):
                 assert self._raw_labels.ndim == 1
                 assert np.all(self._raw_labels >= 0)
         return self._raw_labels
-
-    def close(self): # to be overridden by subclass
-        pass
-
-    def _load_raw_image(self, raw_idx): # to be overridden by subclass
-        raise NotImplementedError
-
-    def _load_raw_labels(self): # to be overridden by subclass
-        raise NotImplementedError
-
-    def __getstate__(self):
-        return dict(self.__dict__, _raw_labels=None)
-
-    def __del__(self):
-        try:
-            self.close()
-        except:
-            pass
 
     def __len__(self):
         return self._raw_idx.size
@@ -186,11 +155,7 @@ class ImageFolderMaskDataset(Dataset):
         raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
         if resolution is not None and (raw_shape[2] != resolution or raw_shape[3] != resolution):
             raise IOError('Image files do not match the specified resolution')
-        self._load_mask()
         super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
-
-    def _load_mask(self, mpath='/data/liwenbo/datasets/Places365/standard/masks_val_512_eval'):
-        self.masks = sorted(glob.glob(mpath + '/*.png'))
 
     @staticmethod
     def _file_ext(fname):
@@ -243,11 +208,12 @@ class ImageFolderMaskDataset(Dataset):
             right = max(0, res - W)
             image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_REFLECT)
         H, W, C = image.shape
-        h = (H - res) // 2
-        w = (W - res) // 2
+        h = random.randint(0, H - res)
+        w = random.randint(0, W - res)
         image = image[h:h+res, w:w+res, :]
 
         image = np.ascontiguousarray(image.transpose(2, 0, 1)) # HWC => CHW
+
         return image
 
     def _load_raw_labels(self):
@@ -267,16 +233,23 @@ class ImageFolderMaskDataset(Dataset):
     def __getitem__(self, idx):
         image = self._load_raw_image(self._raw_idx[idx])
 
-        # for grayscale image
-        if image.shape[0] == 1:
-            image = np.repeat(image, 3, axis=0)
-
         assert isinstance(image, np.ndarray)
         assert list(image.shape) == self.image_shape
         assert image.dtype == np.uint8
         if self._xflip[idx]:
             assert image.ndim == 3 # CHW
             image = image[:, :, ::-1]
-        # mask = RandomMask(image.shape[-1], hole_range=self._hole_range)  # hole as 0, reserved as 1
-        mask = cv2.imread(self.masks[idx], cv2.IMREAD_GRAYSCALE).astype(np.float32)[np.newaxis, :, :] / 255.0
+        mask = RandomMask(image.shape[-1], hole_range=self._hole_range)  # hole as 0, reserved as 1
         return image.copy(), mask, self.get_label(idx)
+
+
+if __name__ == '__main__':
+    res = 512
+    dpath = '/data/liwenbo/datasets/Places365/standard/val_large'
+    D = ImageFolderMaskDataset(path=dpath)
+    print(D.__len__())
+    for i in range(D.__len__()):
+        print(i)
+        a, b, c = D.__getitem__(i)
+        if a.shape != (3, 512, 512):
+            print(i, a.shape)

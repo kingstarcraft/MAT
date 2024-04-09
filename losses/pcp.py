@@ -52,15 +52,15 @@ class PerceptualLoss(nn.Module):
 
         self.criterion_type = criterion
         if self.criterion_type == 'l1':
-            self.criterion = torch.nn.L1Loss()
+            self.criterion_pcp = torch.nn.L1Loss(reduction='sum')
+            self.criterion_style = torch.nn.L1Loss()
         elif self.criterion_type == 'l2':
-            self.criterion = torch.nn.L2loss()
-        elif self.criterion_type == 'fro':
-            self.criterion = None
+            self.criterion_pcp = torch.nn.MSELoss(reduction='sum')
+            self.criterion_style = torch.nn.MSELoss()
         else:
             raise NotImplementedError('%s criterion has not been supported.' % self.criterion_type)
 
-    def forward(self, x, gt):
+    def forward(self, x, gt, mask=None):
         """Forward function.
 
         Args:
@@ -78,17 +78,16 @@ class PerceptualLoss(nn.Module):
         # extract vgg features
         x_features = self.vgg(x)
         gt_features = self.vgg(gt.detach())
+        if mask is None:
+            mask = torch.ones(x.shape, dtype=x.dtype, device=x.device)
+        count = torch.maximum(mask.sum(), torch.tensor(1, dtype=mask.dtype, device=mask.device))
 
         # calculate perceptual loss
         if self.use_pcp_loss:
             percep_loss = 0
             for k in x_features.keys():
-                if self.criterion_type == 'fro':
-                    percep_loss += torch.norm(
-                        x_features[k] - gt_features[k],
-                        p='fro') * self.layer_weights[k]
-                else:
-                    percep_loss += self.criterion(x_features[k], gt_features[k]) * self.layer_weights[k]
+                loss = self.criterion_pcp(x_features[k]*mask, gt_features[k]*mask) * self.layer_weights[k]
+                percep_loss += loss / count
         else:
             percep_loss = None
 
@@ -96,14 +95,8 @@ class PerceptualLoss(nn.Module):
         if self.use_style_loss:
             style_loss = 0
             for k in x_features.keys():
-                if self.criterion_type == 'fro':
-                    style_loss += torch.norm(
-                        self._gram_mat(x_features[k]) -
-                        self._gram_mat(gt_features[k]),
-                        p='fro') * self.layer_weights[k]
-                else:
-                    style_loss += self.criterion(self._gram_mat(x_features[k]), self._gram_mat(gt_features[k])) \
-                                  * self.layer_weights[k]
+                style_loss += self.criterion_style(self._gram_mat(x_features[k]), self._gram_mat(gt_features[k])) \
+                              * self.layer_weights[k]
         else:
             style_loss = None
 
