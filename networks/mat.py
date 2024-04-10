@@ -90,21 +90,9 @@ class Conv2dLayerPartial(nn.Module):
         self.stride = down
         self.padding = kernel_size // 2 if kernel_size % 2 == 1 else 0
 
-    def forward(self, x, mask=None):
-        if mask is not None:
-            with torch.no_grad():
-                if self.weight_maskUpdater.type() != x.type():
-                    self.weight_maskUpdater = self.weight_maskUpdater.to(x)
-                update_mask = F.conv2d(mask, self.weight_maskUpdater, bias=None, stride=self.stride, padding=self.padding)
-                mask_ratio = self.slide_winsize / (update_mask + 1e-8)
-                update_mask = torch.clamp(update_mask, 0, 1)  # 0 or 1
-                mask_ratio = torch.mul(mask_ratio, update_mask)
-            x = self.conv(x)
-            x = torch.mul(x, mask_ratio)
-            return x, update_mask
-        else:
-            x = self.conv(x)
-            return x, None
+    def forward(self, x):
+        x = self.conv(x)
+        return x
 
 
 @persistence.persistent_class
@@ -137,7 +125,7 @@ class WindowAttention(nn.Module):
 
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x, mask_windows=None, mask=None):
+    def forward(self, x, mask=None):
         """
         Args:
             x: input features with shape of (num_windows*B, N, C)
@@ -156,18 +144,11 @@ class WindowAttention(nn.Module):
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
 
-        if mask_windows is not None:
-            attn_mask_windows = mask_windows.squeeze(-1).unsqueeze(1).unsqueeze(1)
-            attn = attn + attn_mask_windows.masked_fill(attn_mask_windows == 0, float(-100.0)).masked_fill(
-                attn_mask_windows == 1, float(0.0))
-            with torch.no_grad():
-                mask_windows = torch.clamp(torch.sum(mask_windows, dim=1, keepdim=True), 0, 1).repeat(1, N, 1)
-
         attn = self.softmax(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
-        return x, mask_windows
+        return x
 
 
 @persistence.persistent_class
@@ -246,7 +227,7 @@ class SwinTransformerBlock(nn.Module):
 
         return attn_mask
 
-    def forward(self, x, x_size, mask=None):
+    def forward(self, x, x_size):
         # H, W = self.input_resolution
         H, W = x_size
         B, L, C = x.shape
@@ -254,59 +235,40 @@ class SwinTransformerBlock(nn.Module):
 
         shortcut = x
         x = x.view(B, H, W, C)
-        if mask is not None:
-            mask = mask.view(B, H, W, 1)
 
         # cyclic shift
         if self.shift_size > 0:
             shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
-            if mask is not None:
-                shifted_mask = torch.roll(mask, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         else:
             shifted_x = x
-            if mask is not None:
-                shifted_mask = mask
 
         # partition windows
         x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
-        if mask is not None:
-            mask_windows = window_partition(shifted_mask, self.window_size)
-            mask_windows = mask_windows.view(-1, self.window_size * self.window_size, 1)
-        else:
-            mask_windows = None
+
 
         # W-MSA/SW-MSA (to be compatible for testing on images whose shapes are the multiple of window size
         if self.input_resolution == x_size:
-            attn_windows, mask_windows = self.attn(x_windows, mask_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+            attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
         else:
-            attn_windows, mask_windows = self.attn(x_windows, mask_windows, mask=self.calculate_mask(x_size).to(x.device))  # nW*B, window_size*window_size, C
+            attn_windows = self.attn(x_windows, mask=self.calculate_mask(x_size).to(x.device))  # nW*B, window_size*window_size, C
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
         shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
-        if mask is not None:
-            mask_windows = mask_windows.view(-1, self.window_size, self.window_size, 1)
-            shifted_mask = window_reverse(mask_windows, self.window_size, H, W)
 
         # reverse cyclic shift
         if self.shift_size > 0:
             x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-            if mask is not None:
-                mask = torch.roll(shifted_mask, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             x = shifted_x
-            if mask is not None:
-                mask = shifted_mask
         x = x.view(B, H * W, C)
-        if mask is not None:
-            mask = mask.view(B, H * W, 1)
 
         # FFN
         x = self.fuse(torch.cat([shortcut, x], dim=-1))
         x = self.mlp(x)
 
-        return x, mask
+        return x
 
 
 @persistence.persistent_class
@@ -321,18 +283,14 @@ class PatchMerging(nn.Module):
                                        )
         self.down = down
 
-    def forward(self, x, x_size, mask=None):
+    def forward(self, x, x_size):
         x = token2feature(x, x_size)
-        if mask is not None:
-            mask = token2feature(mask, x_size)
-        x, mask = self.conv(x, mask)
+        x = self.conv(x)
         if self.down != 1:
             ratio = 1 / self.down
             x_size = (int(x_size[0] * ratio), int(x_size[1] * ratio))
         x = feature2token(x)
-        if mask is not None:
-            mask = feature2token(mask)
-        return x, x_size, mask
+        return x, x_size
 
 
 @persistence.persistent_class
@@ -347,17 +305,13 @@ class PatchUpsampling(nn.Module):
                                        )
         self.up = up
 
-    def forward(self, x, x_size, mask=None):
+    def forward(self, x, x_size):
         x = token2feature(x, x_size)
-        if mask is not None:
-            mask = token2feature(mask, x_size)
-        x, mask = self.conv(x, mask)
+        x = self.conv(x)
         if self.up != 1:
             x_size = (int(x_size[0] * self.up), int(x_size[1] * self.up))
         x = feature2token(x)
-        if mask is not None:
-            mask = feature2token(mask)
-        return x, x_size, mask
+        return x, x_size
 
 
 
@@ -412,22 +366,18 @@ class BasicLayer(nn.Module):
 
         self.conv = Conv2dLayerPartial(in_channels=dim, out_channels=dim, kernel_size=3, activation='lrelu')
 
-    def forward(self, x, x_size, mask=None):
+    def forward(self, x, x_size):
         if self.downsample is not None:
-            x, x_size, mask = self.downsample(x, x_size, mask)
+            x, x_size = self.downsample(x, x_size)
         identity = x
         for blk in self.blocks:
             if self.use_checkpoint:
-                x, mask = checkpoint.checkpoint(blk, x, x_size, mask)
+                x = checkpoint.checkpoint(blk, x, x_size)
             else:
-                x, mask = blk(x, x_size, mask)
-        if mask is not None:
-            mask = token2feature(mask, x_size)
-        x, mask = self.conv(token2feature(x, x_size), mask)
+                x = blk(x, x_size)
+        x = self.conv(token2feature(x, x_size))
         x = feature2token(x) + identity
-        if mask is not None:
-            mask = feature2token(mask)
-        return x, x_size, mask
+        return x, x_size
 
 
 @persistence.persistent_class
@@ -513,7 +463,7 @@ class Encoder(nn.Module):
             res = 2 ** i
             self.resolution.append(res)
             if i == res_log2:
-                block = EncFromRGB(img_channels * 2 + 1, nf(i), activation)
+                block = EncFromRGB(img_channels * 2, nf(i), activation)
             else:
                 block = ConvBlockDown(nf(i+1), nf(i), activation)
             setattr(self, 'EncConv_Block_%dx%d' % (res, res), block)
@@ -703,7 +653,7 @@ class FirstStage(nn.Module):
         super().__init__()
         res = 64
 
-        self.conv_first = Conv2dLayerPartial(in_channels=img_channels+1, out_channels=dim, kernel_size=3, activation=activation)
+        self.conv_first = Conv2dLayerPartial(in_channels=img_channels, out_channels=dim, kernel_size=3, activation=activation)
         self.enc_conv = nn.ModuleList()
         down_time = int(np.log2(img_resolution // res))
         for i in range(down_time):  # from input size to 64
@@ -750,30 +700,30 @@ class FirstStage(nn.Module):
             res = res * 2
             self.dec_conv.append(DecStyleBlock(res, dim, dim, activation, style_dim, use_noise, demodulate, img_channels))
 
-    def forward(self, images_in, masks_in, ws, noise_mode='random'):
-        x = torch.cat([masks_in - 0.5, images_in * masks_in], dim=1)
+    def forward(self, images_in, ws, noise_mode='random'):
+        # x = torch.cat([masks_in - 0.5, images_in * masks_in], dim=1)
 
         skips = []
-        x, mask = self.conv_first(x, masks_in)  # input size
+        x = self.conv_first(images_in)  # input size
         skips.append(x)
         for i, block in enumerate(self.enc_conv):  # input size to 64
-            x, mask = block(x, mask)
+            x = block(x)
             if i != len(self.enc_conv) - 1:
                 skips.append(x)
 
         x_size = x.size()[-2:]
         x = feature2token(x)
-        mask = feature2token(mask)
+        # mask = feature2token(mask)
         mid = len(self.tran) // 2
         for i, block in enumerate(self.tran):  # 64 to 16
             if i < mid:
-                x, x_size, mask = block(x, x_size, mask)
+                x, x_size = block(x, x_size)
                 skips.append(x)
             elif i > mid:
-                x, x_size, mask = block(x, x_size, None)
+                x, x_size = block(x, x_size)
                 x = x + skips[mid - i]
             else:
-                x, x_size, mask = block(x, x_size, None)
+                x, x_size = block(x, x_size)
 
                 mul_map = torch.ones_like(x) * 0.5
                 mul_map = F.dropout(mul_map, training=True)
@@ -790,7 +740,7 @@ class FirstStage(nn.Module):
             x, img = block(x, img, style, skips[len(self.dec_conv)-i-1], noise_mode=noise_mode)
 
         # ensemble
-        img = img * (1 - masks_in) + images_in * masks_in
+        # img = img * (1 - masks_in) + images_in * masks_in
 
         return img
 
@@ -801,9 +751,6 @@ class SynthesisNet(nn.Module):
                  w_dim,                     # Intermediate latent (W) dimensionality.
                  img_resolution,            # Output image resolution.
                  img_channels   = 3,        # Number of color channels.
-                 channel_base   = 32768,    # Overall multiplier for the number of channels.
-                 channel_decay  = 1.0,
-                 channel_max    = 512,      # Maximum number of channels in any layer.
                  activation     = 'lrelu',  # Activation function: 'relu', 'lrelu', etc.
                  drop_rate      = 0.5,
                  use_noise      = True,
@@ -827,12 +774,12 @@ class SynthesisNet(nn.Module):
         style_dim = w_dim + nf(2) * 2
         self.dec = Decoder(resolution_log2, activation, style_dim, use_noise, demodulate, img_channels)
 
-    def forward(self, images_in, masks_in, ws, noise_mode='random', return_stg1=False):
-        out_stg1 = self.first_stage(images_in, masks_in, ws, noise_mode=noise_mode)
+    def forward(self, images_in, ws, noise_mode='random', return_stg1=False):
+        # out_stg1 = self.first_stage(images_in, masks_in, ws, noise_mode=noise_mode)
+        out_stg1 = self.first_stage(images_in, ws, noise_mode=noise_mode)
 
         # encoder
-        x = images_in * masks_in + out_stg1 * (1 - masks_in)
-        x = torch.cat([masks_in - 0.5, x, images_in * masks_in], dim=1)
+        x = torch.cat([out_stg1, images_in], dim=1)
         E_features = self.enc(x)
 
         fea_16 = E_features[4]
@@ -850,7 +797,7 @@ class SynthesisNet(nn.Module):
         img = self.dec(fea_16, ws, gs, E_features, noise_mode=noise_mode)
 
         # ensemble
-        img = img * (1 - masks_in) + images_in * masks_in
+        # img = img * (1 - masks_in) + images_in * masks_in
 
         if not return_stg1:
             return img
@@ -886,16 +833,16 @@ class Generator(nn.Module):
                                   num_ws=self.synthesis.num_layers,
                                   **mapping_kwargs)
 
-    def forward(self, images_in, masks_in, z, c, truncation_psi=1, truncation_cutoff=None, skip_w_avg_update=False,
+    def forward(self, images_in, z, c, truncation_psi=1, truncation_cutoff=None, skip_w_avg_update=False,
                 noise_mode='random', return_stg1=False):
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff,
                           skip_w_avg_update=skip_w_avg_update)
 
         if not return_stg1:
-            img = self.synthesis(images_in, masks_in, ws, noise_mode=noise_mode)
+            img = self.synthesis(images_in, ws, noise_mode=noise_mode)
             return img
         else:
-            img, out_stg1 = self.synthesis(images_in, masks_in, ws, noise_mode=noise_mode, return_stg1=True)
+            img, out_stg1 = self.synthesis(images_in, ws, noise_mode=noise_mode, return_stg1=True)
             return img, out_stg1
 
 
@@ -905,9 +852,6 @@ class Discriminator(torch.nn.Module):
                  c_dim,                        # Conditioning label (C) dimensionality.
                  img_resolution,               # Input resolution.
                  img_channels,                 # Number of input color channels.
-                 channel_base       = 32768,    # Overall multiplier for the number of channels.
-                 channel_max        = 512,      # Maximum number of channels in any layer.
-                 channel_decay      = 1,
                  cmap_dim           = None,     # Dimensionality of mapped conditioning label, None = default.
                  activation         = 'lrelu',
                  mbstd_group_size   = 4,        # Group size for the minibatch standard deviation layer, None = entire minibatch.
@@ -931,7 +875,7 @@ class Discriminator(torch.nn.Module):
         if c_dim > 0:
             self.mapping = MappingNet(z_dim=0, c_dim=c_dim, w_dim=cmap_dim, num_ws=None, w_avg_beta=None)
 
-        Dis = [DisFromRGB(img_channels+1, nf(resolution_log2), activation)]
+        Dis = [DisFromRGB(img_channels, nf(resolution_log2), activation)]
         for res in range(resolution_log2, 2, -1):
             Dis.append(DisBlock(nf(res), nf(res-1), activation))
 
@@ -944,7 +888,7 @@ class Discriminator(torch.nn.Module):
         self.fc1 = FullyConnectedLayer(nf(2), 1 if cmap_dim == 0 else cmap_dim)
 
         # for 64x64
-        Dis_stg1 = [DisFromRGB(img_channels+1, nf(resolution_log2) // 2, activation)]
+        Dis_stg1 = [DisFromRGB(img_channels, nf(resolution_log2) // 2, activation)]
         for res in range(resolution_log2, 2, -1):
             Dis_stg1.append(DisBlock(nf(res) // 2, nf(res - 1) // 2, activation))
 
@@ -956,11 +900,13 @@ class Discriminator(torch.nn.Module):
         self.fc0_stg1 = FullyConnectedLayer(nf(2) // 2 * 4 ** 2, nf(2) // 2, activation=activation)
         self.fc1_stg1 = FullyConnectedLayer(nf(2) // 2, 1 if cmap_dim == 0 else cmap_dim)
 
-    def forward(self, images_in, masks_in, images_stg1, c):
-        x = self.Dis(torch.cat([masks_in - 0.5, images_in], dim=1))
+    def forward(self, images_in, images_stg1, c):
+        # x = self.Dis(torch.cat([masks_in - 0.5, images_in], dim=1))
+        x = self.Dis(images_in)
         x = self.fc1(self.fc0(x.flatten(start_dim=1)))
 
-        x_stg1 = self.Dis_stg1(torch.cat([masks_in - 0.5, images_stg1], dim=1))
+        # x_stg1 = self.Dis_stg1(torch.cat([masks_in - 0.5, images_stg1], dim=1))
+        x_stg1 = self.Dis_stg1(images_stg1)
         x_stg1 = self.fc1_stg1(self.fc0_stg1(x_stg1.flatten(start_dim=1)))
 
         if self.c_dim > 0:
@@ -980,7 +926,6 @@ if __name__ == '__main__':
     G = Generator(z_dim=512, c_dim=0, w_dim=512, img_resolution=512, img_channels=3).to(device)
     D = Discriminator(c_dim=0, img_resolution=res, img_channels=3).to(device)
     img = torch.randn(batch, 3, res, res).to(device)
-    mask = torch.randn(batch, 1, res, res).to(device)
     z = torch.randn(batch, 512).to(device)
     G.eval()
 
@@ -990,7 +935,7 @@ if __name__ == '__main__':
     # print('discriminator', count(D))
 
     with torch.no_grad():
-        img, img_stg1 = G(img, mask, z, None, return_stg1=True)
+        img, img_stg1 = G(img, z, None, return_stg1=True)
     print('output of G:', img.shape, img_stg1.shape)
-    score, score_stg1 = D(img, mask, img_stg1, None)
+    score, score_stg1 = D(img, img_stg1, None)
     print('output of D:', score.shape, score_stg1.shape)
