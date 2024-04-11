@@ -21,7 +21,7 @@ try:
 except ImportError:
     pyspng = None
 
-from datasets.mask_generator_512 import RandomMask
+from .mask_generator_512 import RandomMask
 
 #----------------------------------------------------------------------------
 

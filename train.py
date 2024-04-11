@@ -123,9 +123,9 @@ def setup_training_loop_kwargs(
     if data_val is None:
         data_val = data
     if dataloader is None:
-        dataloader = 'datasets.dataset_512.ImageFolderMaskDataset'
+        dataloader = 'datasets.aapm.AAPMDataset'
 
-    args.training_set_kwargs = dnnlib.EasyDict(class_name=dataloader, path=data,
+    args.training_set_kwargs = dnnlib.EasyDict(class_name=dataloader, root=data,
                                                use_labels=True, max_size=None, xflip=False)
     args.val_set_kwargs = dnnlib.EasyDict(class_name=dataloader, path=data_val,
                                           use_labels=True, max_size=None, xflip=False)
@@ -495,8 +495,9 @@ class CommaSeparatedList(click.ParamType):
 @click.option('-n', '--dry-run', help='Print training options and exit', is_flag=True)
 
 # Dataset.
-@click.option('--data', help='Training data (directory or zip)', metavar='PATH', required=True)
-@click.option('--data_val', help='Validation data (directory or zip)', metavar='PATH')
+@click.option('--root', help='data root', metavar='PATH', required=True)
+@click.option('--train', help='Training list', metavar='PATH', required=True)
+@click.option('--test', help='test list', metavar='PATH')
 @click.option('--dataloader', help='dataloader', type=str, metavar='STRING')
 @click.option('--cond', help='Train conditional model based on dataset labels [default: false]', type=bool, metavar='BOOL')
 @click.option('--subset', help='Train with only N images [default: all]', type=int, metavar='INT')
