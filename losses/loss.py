@@ -131,8 +131,8 @@ class TwoStageLoss(Loss):
         if do_Dmain or do_Dr1:
             name = 'Dreal_Dr1' if do_Dmain and do_Dr1 else 'Dreal' if do_Dmain else 'Dr1'
             with torch.autograd.profiler.record_function(name + '_forward'):
-                real_img_tmp = real_x.detach().requires_grad_(do_Dr1)
-                real_img_tmp_stg1 = real_x.detach().requires_grad_(do_Dr1)
+                real_img_tmp = real_y.detach().requires_grad_(do_Dr1)
+                real_img_tmp_stg1 = real_y.detach().requires_grad_(do_Dr1)
                 real_logits, real_logits_stg1 = self.run_D(real_img_tmp, real_img_tmp_stg1, real_c, sync=sync)
                 training_stats.report('Loss/scores/real', real_logits)
                 training_stats.report('Loss/signs/real', real_logits.sign())
