@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 import legacy
-from datasets.mask_generator_512 import RandomMask
+from dataset.mask_generator_512 import RandomMask
 from networks.mat import Generator
 
 

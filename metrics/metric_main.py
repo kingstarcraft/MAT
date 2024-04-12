@@ -83,49 +83,44 @@ def report_metric(result_dict, run_dir=None, snapshot_pkl=None):
 
 @register_metric
 def fid2993_full(opts):
-    opts.dataset_kwargs.update(max_size=None, xflip=False)
     fid = frechet_inception_distance.compute_fid(opts, max_real=2993, num_gen=2993)
     return dict(fid2993_full=fid)
 
 @register_metric
 def fid36k5_full(opts):
-    opts.dataset_kwargs.update(max_size=None, xflip=False)
     fid = frechet_inception_distance.compute_fid(opts, max_real=36500, num_gen=36500)
     return dict(fid36k5_full=fid)
 
 @register_metric
 def fid_places(opts):
-    opts.dataset_kwargs.update(max_size=None, xflip=False)
     fid = frechet_inception_distance.compute_fid(opts, max_real=36500, num_gen=36500)
     return dict(fid36k5_full=fid)
 
 @register_metric
 def ids_places(opts):
-    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    #opts.dataset_kwargs.update(max_size=None, xflip=False)
     u_ids, p_ids = inception_discriminative_score.compute_ids(opts, max_real=36500, num_gen=36500)
     return dict(u_ids=u_ids, p_ids=p_ids)
 
 @register_metric
 def psnr36k5_full(opts):
-    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    #opts.dataset_kwargs.update(max_size=None, xflip=False)
     psnr, ssim, l1 = psnr_ssim_l1.compute_psnr(opts, max_real=36500)
     return dict(psnr=psnr, ssim=ssim, l1=l1)
 
 @register_metric
 def fid50k_full(opts):
-    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    #opts.dataset_kwargs.update(max_size=None, xflip=False)
     fid = frechet_inception_distance.compute_fid(opts, max_real=None, num_gen=50000)
     return dict(fid50k_full=fid)
 
 @register_metric
 def kid50k_full(opts):
-    opts.dataset_kwargs.update(max_size=None, xflip=False)
     kid = kernel_inception_distance.compute_kid(opts, max_real=1000000, num_gen=50000, num_subsets=100, max_subset_size=1000)
     return dict(kid50k_full=kid)
 
 @register_metric
 def pr50k3_full(opts):
-    opts.dataset_kwargs.update(max_size=None, xflip=False)
     precision, recall = precision_recall.compute_pr(opts, max_real=200000, num_gen=50000, nhood_size=3, row_batch_size=10000, col_batch_size=10000)
     return dict(pr50k3_full_precision=precision, pr50k3_full_recall=recall)
 

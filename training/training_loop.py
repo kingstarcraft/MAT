@@ -11,11 +11,14 @@ import time
 import copy
 import json
 import pickle
+
+import cv2
 import psutil
 import PIL.Image
 import numpy as np
 import torch
 import dnnlib
+import utils
 from torch_utils import misc
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
@@ -41,7 +44,7 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
         # Group training samples by label.
         label_groups = dict() # label => [idx, ...]
         for idx in range(len(training_set)):
-            label = tuple(training_set.get_details(idx).raw_label.flat[::-1])
+            label = training_set.get_label(idx)
             if label not in label_groups:
                 label_groups[label] = []
             label_groups[label].append(idx)
@@ -60,30 +63,23 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
             label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
 
     # Load data.
-    images, masks, labels = zip(*[training_set[i] for i in grid_indices])
-    return (gw, gh), np.stack(images), np.stack(masks), np.stack(labels)
+    x, y, l = zip(*[training_set[i] for i in grid_indices])
+    return (gw, gh), np.stack(x), np.stack(y), np.stack(l)
 
 #----------------------------------------------------------------------------
 
-def save_image_grid(img, fname, drange, grid_size):
-    lo, hi = drange
-    img = np.asarray(img, dtype=np.float32)
-    img = (img - lo) * (255 / (hi - lo))
-    img = np.rint(img).clip(0, 255).astype(np.uint8)
+def save_image_grid(img, fname, grid_size):
+   gw, gh = grid_size
+   _N, C, H, W = img.shape
+   img = img.reshape(gh, gw, C, H, W)
 
-    gw, gh = grid_size
-    _N, C, H, W = img.shape
-    img = img.reshape(gh, gw, C, H, W)
-    img = img.transpose(0, 3, 1, 4, 2)
-    img = img.reshape(gh * H, gw * W, C)
-
-    assert C in [1, 3]
-    if C == 1:
-        PIL.Image.fromarray(img[:, :, 0], 'L').save(fname)
-    if C == 3:
-        PIL.Image.fromarray(img, 'RGB').save(fname)
-
-#----------------------------------------------------------------------------
+   img = img.transpose(2, 0, 3, 1, 4)
+   img = img.reshape(C, gh * H, gw * W)
+   img = utils.denormalize(img)
+   img = (img + 2000) / 8000
+   img = (img.clip(0, 1) * 255).astype('uint8')
+   cv2.imwrite(fname, img)
+   #----------------------------------------------------------------------------
 
 def training_loop(
     run_dir                 = '.',      # Output directory.
@@ -141,8 +137,6 @@ def training_loop(
     if rank == 0:
         print()
         print('Num images: ', len(training_set))
-        print('Image shape:', training_set.image_shape)
-        print('Label shape:', training_set.label_shape)
         print()
 
     # Construct networks.
@@ -168,11 +162,10 @@ def training_loop(
         # adaptation to inpainting config
         # G
         img_in = torch.empty([batch_gpu, training_set.num_channels, training_set.resolution, training_set.resolution], device=device)
-        mask_in = torch.empty([batch_gpu, 1, training_set.resolution, training_set.resolution], device=device)
-        img = misc.print_module_summary(G, [img_in, mask_in, z, c])
+        img = misc.print_module_summary(G, [img_in, z, c])
         # D
         img_stg1 = torch.empty([batch_gpu, 3, training_set.resolution, training_set.resolution], device=device)
-        misc.print_module_summary(D, [img, mask_in, img_stg1, c])
+        misc.print_module_summary(D, [img, img_stg1, c])
 
     # Setup augmentation.
     if rank == 0:
@@ -247,23 +240,19 @@ def training_loop(
     grid_z = None
     grid_c = None
     grid_img = None
-    grid_mask = None
     if rank == 0:
         print('Exporting sample images...')
-        grid_size, images, masks, labels = setup_snapshot_image_grid(training_set=val_set)
-        save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0, 255], grid_size=grid_size)
-        # adaptation to inpainting config
-        save_image_grid(masks, os.path.join(run_dir, 'masks.png'), drange=[0, 1], grid_size=grid_size)
+        grid_size, images, _, labels = setup_snapshot_image_grid(training_set=val_set)
+        save_image_grid(images, os.path.join(run_dir, 'reals.png'), grid_size=grid_size)
         # --------------------
         grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
         grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
         # adaptation to inpainting config
-        grid_img = (torch.from_numpy(images).to(device) / 127.5 - 1).split(batch_gpu)  # [-1, 1]
-        grid_mask = torch.from_numpy(masks).to(device).split(batch_gpu)  # {0, 1}
-        images = torch.cat([G_ema(img_in, mask_in, z, c, noise_mode='const').cpu() \
-                            for img_in, mask_in, z, c in zip(grid_img, grid_mask, grid_z, grid_c)]).numpy()
+        grid_img = (torch.from_numpy(images).to(device)).split(batch_gpu)  # [-1, 1]{0, 1}
+        images = torch.cat([G_ema(img_in, z, c, noise_mode='const').cpu()
+                            for img_in, z, c in zip(grid_img, grid_z, grid_c)]).numpy()
         # --------------------
-        save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
+        save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), grid_size=grid_size)
 
     # Initialize logs.
     if rank == 0:
@@ -296,12 +285,12 @@ def training_loop(
 
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
-            phase_real_img, phase_mask, phase_real_c = next(training_set_iterator)
-            phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
+            phase_real_x, phase_real_y, phase_c = next(training_set_iterator)
+            phase_real_x = (phase_real_x.to(device).to(torch.float32)).split(batch_gpu)
             # adaptation to inpainting config
-            phase_mask = phase_mask.to(device).to(torch.float32).split(batch_gpu)
+            phase_real_y = phase_real_y.to(device).to(torch.float32).split(batch_gpu)
             # --------------------
-            phase_real_c = phase_real_c.to(device).split(batch_gpu)
+            phase_real_c = phase_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
             all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
             all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
@@ -320,10 +309,10 @@ def training_loop(
             phase.module.requires_grad_(True)
 
             # Accumulate gradients over multiple rounds.
-            for round_idx, (real_img, mask, real_c, gen_z, gen_c) in enumerate(zip(phase_real_img, phase_mask, phase_real_c, phase_gen_z, phase_gen_c)):
+            for round_idx, (real_x, real_y, real_c, gen_z, gen_c) in enumerate(zip(phase_real_x, phase_real_y, phase_real_c, phase_gen_z, phase_gen_c)):
                 sync = (round_idx == batch_size // (batch_gpu * num_gpus) - 1)
                 gain = phase.interval
-                loss.accumulate_gradients(phase=phase.name, real_img=real_img, mask=mask, real_c=real_c, gen_z=gen_z, gen_c=gen_c, sync=sync, gain=gain)
+                loss.accumulate_gradients(phase=phase.name, real_x=real_x, real_y=real_y, real_c=real_c, gen_z=gen_z, gen_c=gen_c, sync=sync, gain=gain)
 
             # Update weights.
             phase.module.requires_grad_(False)
@@ -388,9 +377,9 @@ def training_loop(
 
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            images = torch.cat([G_ema(img_in, mask_in, z, c, noise_mode='const').cpu() \
-                                for img_in, mask_in, z, c in zip(grid_img, grid_mask, grid_z, grid_c)]).numpy()
-            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+            images = torch.cat([G_ema(img_in, z, c, noise_mode='const').cpu() \
+                                for img_in, z, c in zip(grid_img, grid_z, grid_c)]).numpy()
+            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), grid_size=grid_size)
 
         # Save network snapshot.
         snapshot_pkl = None

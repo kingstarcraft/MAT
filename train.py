@@ -39,8 +39,9 @@ def setup_training_loop_kwargs(
     seed       = None, # Random seed: <int>, default = 0
 
     # Dataset.
-    data       = None, # Training dataset (required): <path>
-    data_val   = None, # Validation dataset: <path>, default = None. If none, data_val = data
+    root       = None,
+    train      = None, # Training dataset (required): <path>
+    test       = None, # Validation dataset: <path>, default = None. If none, data_val = data
     dataloader = None, # Dataloader, string
     cond       = None, # Train conditional model based on dataset labels: <bool>, default = False
     subset     = None, # Train with only N images: <int>, default = all
@@ -118,17 +119,16 @@ def setup_training_loop_kwargs(
     # Dataset: data, cond, subset, mirror
     # -----------------------------------
 
-    assert data is not None
-    assert isinstance(data, str)
-    if data_val is None:
-        data_val = data
+    assert root is not None
+    assert train is not None
+    assert test is not None
     if dataloader is None:
-        dataloader = 'datasets.aapm.AAPMDataset'
+        dataloader = 'dataset.aapm.AAPMDataset'
 
-    args.training_set_kwargs = dnnlib.EasyDict(class_name=dataloader, root=data,
-                                               use_labels=True, max_size=None, xflip=False)
-    args.val_set_kwargs = dnnlib.EasyDict(class_name=dataloader, path=data_val,
-                                          use_labels=True, max_size=None, xflip=False)
+    args.training_set_kwargs = dnnlib.EasyDict(
+        class_name=dataloader, root=root,  filenames=train, resolution=512
+    )
+    args.val_set_kwargs = dnnlib.EasyDict(class_name=dataloader, root=root,  filenames=test, resolution=512)
     args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2)
 
     try:
@@ -136,13 +136,13 @@ def setup_training_loop_kwargs(
         training_set = dnnlib.util.construct_class_by_name(**args.training_set_kwargs) # subclass of training.dataset.Dataset
         args.training_set_kwargs.resolution = training_set.resolution # be explicit about resolution
         args.training_set_kwargs.use_labels = training_set.has_labels # be explicit about labels
-        args.training_set_kwargs.max_size = len(training_set) # be explicit about dataset size
+        args.training_set_kwargs.transform = True
         desc = training_set.name
         # validation part
         val_set = dnnlib.util.construct_class_by_name(**args.val_set_kwargs)
         args.val_set_kwargs.resolution = val_set.resolution
         args.val_set_kwargs.use_labels = val_set.has_labels
-        args.val_set_kwargs.max_size = len(val_set)
+        args.val_set_kwargs.transform = False
 
         del training_set, val_set # conserve memory
     except IOError as err:
@@ -167,13 +167,6 @@ def setup_training_loop_kwargs(
         if subset < args.training_set_kwargs.max_size:
             args.training_set_kwargs.max_size = subset
             args.training_set_kwargs.random_seed = args.random_seed
-
-    if mirror is None:
-        mirror = False
-    assert isinstance(mirror, bool)
-    if mirror:
-        desc += '-mirror'
-        args.training_set_kwargs.xflip = True
 
     # ------------------------------------
     # Base config: cfg, gamma, kimg, batch
@@ -217,8 +210,8 @@ def setup_training_loop_kwargs(
         zdim = 512
     args.G_kwargs = dnnlib.EasyDict(class_name=generator, z_dim=zdim, w_dim=wdim, mapping_kwargs=dnnlib.EasyDict(), synthesis_kwargs=dnnlib.EasyDict())
     args.D_kwargs = dnnlib.EasyDict(class_name=discriminator)
-    args.G_kwargs.synthesis_kwargs.channel_base = args.D_kwargs.channel_base = int(spec.fmaps * 32768)
-    args.G_kwargs.synthesis_kwargs.channel_max = args.D_kwargs.channel_max = 512
+    # args.G_kwargs.synthesis_kwargs.channel_base = args.D_kwargs.channel_base = int(spec.fmaps * 32768)
+    # args.G_kwargs.synthesis_kwargs.channel_max = args.D_kwargs.channel_max = 512
     args.G_kwargs.mapping_kwargs.num_layers = spec.map
     # args.G_kwargs.synthesis_kwargs.num_fp16_res = args.D_kwargs.num_fp16_res = 4 # enable mixed-precision training
     # args.G_kwargs.synthesis_kwargs.conv_clamp = args.D_kwargs.conv_clamp = 256 # clamp activations to avoid float16 overflow
@@ -482,7 +475,6 @@ class CommaSeparatedList(click.ParamType):
         return value.split(',')
 
 #----------------------------------------------------------------------------
-
 @click.command()
 @click.pass_context
 
@@ -607,20 +599,17 @@ def main(ctx, outdir, dry_run, **config_kwargs):
     print(json.dumps(args, indent=2))
     print()
     print(f'Output directory:   {args.run_dir}')
-    print(f'Training data:      {args.training_set_kwargs.path}')
+    print(f'Data Root:          {args.training_set_kwargs.root}')
+    print(f'Training data:      {args.training_set_kwargs.filenames}')
     print(f'Training duration:  {args.total_kimg} kimg')
     print(f'Number of GPUs:     {args.num_gpus}')
-    print(f'Number of images:   {args.training_set_kwargs.max_size}')
     print(f'Image resolution:   {args.training_set_kwargs.resolution}')
     print(f'Conditional model:  {args.training_set_kwargs.use_labels}')
-    print(f'Dataset x-flips:    {args.training_set_kwargs.xflip}')
     print()
     print('Validation options:')
-    print(f'Validation data:      {args.val_set_kwargs.path}')
-    print(f'Number of images:   {args.val_set_kwargs.max_size}')
+    print(f'Validation data:    {args.val_set_kwargs.filenames}')
     print(f'Image resolution:   {args.val_set_kwargs.resolution}')
     print(f'Conditional model:  {args.val_set_kwargs.use_labels}')
-    print(f'Dataset x-flips:    {args.val_set_kwargs.xflip}')
     print()
 
     # Dry run?

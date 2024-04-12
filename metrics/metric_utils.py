@@ -216,12 +216,13 @@ def compute_feature_stats_for_dataset(opts, detector_url, detector_kwargs, rel_l
     item_subset = [(i * opts.num_gpus + opts.rank) % num_items for i in range((num_items - 1) // opts.num_gpus + 1)]
     # for images, _labels in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset, batch_size=batch_size, **data_loader_kwargs):
     # adaptation to inpainting
-    for images, masks, _labels in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset, batch_size=batch_size,
+    for x, y, _labels in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset, batch_size=batch_size,
                                                        **data_loader_kwargs):
     # --------------------------------
-        if images.shape[1] == 1:
-            images = images.repeat([1, 3, 1, 1])
-        features = detector(images.to(opts.device), **detector_kwargs)
+        y = ((y + 1.0) * 127.5).clamp(0, 255).round().to(torch.uint8)
+        if y.shape[1] == 1:
+            y = y.repeat([1, 3, 1, 1])
+        features = detector(y.to(opts.device), **detector_kwargs)
         stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
         progress.update(stats.num_items)
 
@@ -248,8 +249,8 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
     dataset = dnnlib.util.construct_class_by_name(**opts.dataset_kwargs)
 
     # Image generation func.
-    def run_generator(img_in, mask_in, z, c):
-        img = G(img_in, mask_in, z, c, **opts.G_kwargs)
+    def run_generator(img_in, z, c):
+        img = G(img_in, z, c, **opts.G_kwargs)
         # img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         img = ((img + 1.0) * 127.5).clamp(0, 255).round().to(torch.uint8)
         return img
@@ -261,6 +262,7 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
     #     run_generator = torch.jit.trace(run_generator, [z, c], check_trace=False)
 
     # Initialize.
+    stats_kwargs['max_items'] = min(len(dataset), stats_kwargs['max_items'])
     stats = FeatureStats(**stats_kwargs)
     assert stats.max_items is not None
     progress = opts.progress.sub(tag='generator features', num_items=stats.max_items, rel_lo=rel_lo, rel_hi=rel_hi)
@@ -268,17 +270,17 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
 
     # Main loop.
     item_subset = [(i * opts.num_gpus + opts.rank) % stats.max_items for i in range((stats.max_items - 1) // opts.num_gpus + 1)]
-    for imgs_batch, masks_batch, labels_batch in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset,
+    for xs_batch, ys_batch, labels_batch in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset,
                                                               batch_size=batch_size,
                                                               **data_loader_kwargs):
         images = []
-        imgs_gen = (imgs_batch.to(opts.device).to(torch.float32) / 127.5 - 1).split(batch_gen)
-        masks_gen = masks_batch.to(opts.device).to(torch.float32).split(batch_gen)
-        for img_in, mask_in in zip(imgs_gen, masks_gen):
-            z = torch.randn([img_in.shape[0], G.z_dim], device=opts.device)
-            c = [dataset.get_label(np.random.randint(len(dataset))) for _i in range(img_in.shape[0])]
+        xs_gen = (xs_batch.to(opts.device).to(torch.float32) / 127.5 - 1).split(batch_gen)
+        ys_gen = ys_batch.to(opts.device).to(torch.float32).split(batch_gen)
+        for x, y in zip(xs_gen, ys_gen):
+            z = torch.randn([x.shape[0], G.z_dim], device=opts.device)
+            c = [dataset.get_label(np.random.randint(len(dataset))) for _i in range(y.shape[0])]
             c = torch.from_numpy(np.stack(c)).pin_memory().to(opts.device)
-            images.append(run_generator(img_in, mask_in, z, c))
+            images.append(run_generator(x, z, c))
         images = torch.cat(images)
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])
@@ -302,8 +304,8 @@ def compute_image_stats_for_generator(opts, rel_lo=0, rel_hi=1, batch_size=64, b
     dataset = dnnlib.util.construct_class_by_name(**opts.dataset_kwargs)
 
     # Image generation func.
-    def run_generator(img_in, mask_in, z, c):
-        img = G(img_in, mask_in, z, c, **opts.G_kwargs)
+    def run_generator(img_in, z, c):
+        img = G(img_in, z, c, **opts.G_kwargs)
         # img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         img = ((img + 1.0) * 127.5).clamp(0, 255).round().to(torch.uint8)
         return img
@@ -315,25 +317,25 @@ def compute_image_stats_for_generator(opts, rel_lo=0, rel_hi=1, batch_size=64, b
 
     # Main loop.
     item_subset = [(i * opts.num_gpus + opts.rank) % stats.max_items for i in range((stats.max_items - 1) // opts.num_gpus + 1)]
-    for imgs_batch, masks_batch, labels_batch in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset,
+    for xs_batch, ys_batch, labels_batch in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset,
                                                                              batch_size=batch_size,
                                                                              **data_loader_kwargs):
         images = []
-        imgs_gen = (imgs_batch.to(opts.device).to(torch.float32) / 127.5 - 1).split(batch_gen)
-        masks_gen = masks_batch.to(opts.device).to(torch.float32).split(batch_gen)
-        for img_in, mask_in in zip(imgs_gen, masks_gen):
-            z = torch.randn([img_in.shape[0], G.z_dim], device=opts.device)
+        imgs_gen = (xs_batch.to(opts.device).to(torch.float32) / 127.5 - 1).split(batch_gen)
+        ys_gen = ys_batch.to(opts.device).to(torch.float32).split(batch_gen)
+        for x, y in zip(imgs_gen, ys_gen):
+            z = torch.randn([x.shape[0], G.z_dim], device=opts.device)
             c = [dataset.get_label(np.random.randint(len(dataset))) for _i in range(img_in.shape[0])]
             c = torch.from_numpy(np.stack(c)).pin_memory().to(opts.device)
-            images.append(run_generator(img_in, mask_in, z, c))
+            images.append(run_generator(x, z, c))
         images = torch.cat(images)
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])
 
-        assert imgs_batch.shape == images.shape
+        assert xs_batch.shape == images.shape
         metrics = []
-        for i in range(imgs_batch.shape[0]):
-            img_real = np.transpose(imgs_batch[i].cpu().numpy(), [1, 2, 0])
+        for i in range(ys_batch.shape[0]):
+            img_real = np.transpose(ys_batch[i].cpu().numpy(), [1, 2, 0])
             img_gen = np.transpose(images[i].cpu().numpy(), [1, 2, 0])
             psnr = calculate_psnr(img_gen, img_real)
             ssim = calculate_ssim(img_gen, img_real)

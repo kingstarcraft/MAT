@@ -15,7 +15,7 @@ from networks.basic_module import FullyConnectedLayer, Conv2dLayer, MappingNet, 
 
 
 @misc.profiled_function
-def nf(stage, channel_base=32768, channel_decay=1.0, channel_max=512):
+def nf(stage):
     NF = {512: 64, 256: 128, 128: 256, 64: 512, 32: 512, 16: 512, 8: 512, 4: 512}
     return NF[2 ** stage]
 

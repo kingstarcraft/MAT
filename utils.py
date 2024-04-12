@@ -20,4 +20,6 @@ def denormalize(image):
 
 
 def load(file, size):
+    if isinstance(size, int):
+        size = size, size
     return np.fromfile(file, dtype='float32').reshape(*size)
